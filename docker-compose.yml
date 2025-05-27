@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    command: ["redis-server","--requirepass","sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  tracker:
+    build: .
+    restart: unless-stopped         # auto-start on VM reboot
+    depends_on:
+      - redis                       # wait for Redis to be healthy
+    # No environment: section → no `.env` file needed
+
+volumes:
+  redis-data:
