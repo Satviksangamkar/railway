@@ -1,4 +1,6 @@
+
 # requirements.txt  ── minimal lock-free spec
 requests>=2.31,<3.0        # REST snapshot calls
 websockets>=12.0,<13.0     # Binance depth stream
 redis[hiredis]>=5.0,<6.0   # Redis client (+ hiredis parser for speed)
+websocket-client>=1.8.0
