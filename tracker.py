@@ -8,7 +8,7 @@ BTC-USDT futures order-book tracker – production version
 • Structured logging, back-off, latency stats
 """
 
-import asyncio, json, time, sys, random, logging
+import asyncio, json, time, sys, random, logging, os
 from typing import Dict, List, Tuple
 
 import requests, websockets, redis
@@ -72,15 +72,12 @@ last_update_id: int = 0
 
 # ──────────────────────── HELPER FUNCTIONS ────────────────────────────────
 def clear_screen() -> None:
-    """ANSI clear compatible with Linux & Windows 10+ terminals."""
     print("\033[2J\033[H", end="")
 
 def now_minute() -> int:
-    """Current unix time floored to minute."""
     return int(time.time()) // 60
 
 def backoff(attempt: int, base: float = 5.0, cap: float = 60.0) -> float:
-    """Exponential back-off with jitter."""
     return min(cap, base * 2 ** attempt) * (0.5 + random.random() / 2)
 
 # ───────────────────────── SNAPSHOT FETCH ─────────────────────────────────
@@ -96,12 +93,10 @@ def fetch_snapshot() -> int:
             data = resp.json()
             sid = data["lastUpdateId"]
 
-            # clear current book in Redis & memory
             r.delete(BIDS_ZSET, ASKS_ZSET, QTY_HASH)
             bids.clear(); asks.clear()
 
             pipe = r.pipeline()
-            # store bids
             for p_str, q_str in data["bids"]:
                 qty = float(q_str)
                 if qty:
@@ -109,7 +104,6 @@ def fetch_snapshot() -> int:
                     bids[price] = qty
                     pipe.zadd(BIDS_ZSET, {p_str: price})
                     pipe.hset(QTY_HASH, p_str, q_str)
-            # store asks
             for p_str, q_str in data["asks"]:
                 qty = float(q_str)
                 if qty:
@@ -119,7 +113,8 @@ def fetch_snapshot() -> int:
                     pipe.hset(QTY_HASH, p_str, q_str)
             pipe.execute()
 
-            log.info("[REST] snapshot id=%s bids=%d asks=%d", sid, len(bids), len(asks))
+            log.info("[REST] snapshot id=%s bids=%d asks=%d",
+                     sid, len(bids), len(asks))
             return sid
         except Exception as e:
             delay = backoff(attempt)
@@ -140,10 +135,8 @@ def _update_level(book: Dict[float, float], zset: str,
         r.hset(QTY_HASH, price_str, qty_str)
 
 def apply_diff_to_state(diff: dict):
-    """Apply diff to Redis AND in-memory dicts + push to list."""
     u = diff["u"]
 
-    # store raw diff
     r.rpush(DIFFS_LIST, json.dumps(diff))
     r.ltrim(DIFFS_LIST, -MAX_UPDATES, -1)
 
@@ -155,12 +148,11 @@ def apply_diff_to_state(diff: dict):
         price, qty = float(p_str), float(q_str)
         _update_level(asks, ASKS_ZSET, price, qty, p_str, q_str)
     latency = (time.perf_counter() - t0) * 1000
-    log.debug("[DIFF] applied id=%d levels=%d latency=%.2f ms", u,
-              len(diff.get("b", [])) + len(diff.get("a", [])), latency)
+    log.debug("[DIFF] applied id=%d levels=%d latency=%.2f ms",
+              u, len(diff.get("b", [])) + len(diff.get("a", [])), latency)
 
 # ───────────────────────── REDIS HELPERS ──────────────────────────────────
 def best_bid_ask() -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """(price, qty) tuples for best bid & ask using Redis."""
     bid_p, _ = r.zrevrange(BIDS_ZSET, 0, 0, withscores=True)[0]
     ask_p, _ = r.zrange(ASKS_ZSET, 0, 0, withscores=True)[0]
     bid_q = float(r.hget(QTY_HASH, bid_p) or 0)
@@ -216,7 +208,6 @@ async def snapshot_archiver():
         log.info("[ARCHIVE] stored %s (levels=%d+%d)",
                  key, len(bids), len(asks))
 
-        # Optional depth trimming
         if TRIM_DEPTH_PCT:
             (best_bid, _), (best_ask, _) = best_bid_ask()
             bid_floor = best_bid * (1 - TRIM_DEPTH_PCT / 100)
@@ -230,7 +221,10 @@ async def open_ws():
     while True:
         try:
             ws = await websockets.connect(
-                WS_URL, ping_interval=15, ping_timeout=15
+                WS_URL,
+                ping_interval=20, ping_timeout=20,
+                max_queue=None,
+                compression=None
             )
             log.info("[WS] connected")
             return ws
@@ -242,54 +236,51 @@ async def open_ws():
 
 async def ws_handler():
     global last_update_id
-    last_update_id = fetch_snapshot()
 
-    ws = await open_ws()
-    synced = False
-    last_refresh = time.time()
+    while True:                                     # outer resync loop
+        last_update_id = fetch_snapshot()
+        ws = await open_ws()
+        synced = False
+        last_refresh = time.time()
 
-    while True:
         try:
-            msg = await asyncio.wait_for(ws.recv(), timeout=30)
-        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-            log.warning("[WS] timed-out/closed – reconnecting")
-            ws = await open_ws()
-            synced = False
-            continue
+            while True:                             # recv loop
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                except (asyncio.TimeoutError,
+                        websockets.exceptions.ConnectionClosed):
+                    log.warning("[WS] timed-out/closed – reconnecting")
+                    break                           # resync outer loop
 
-        diff = json.loads(msg)
-        U, u = diff["U"], diff["u"]
-        log.debug("[WS] recv U=%d u=%d", U, u)
+                diff = json.loads(msg)
+                U, u = diff["U"], diff["u"]
+                log.debug("[WS] recv U=%d u=%d", U, u)
 
-        # discard old
-        if u <= last_update_id:
-            continue
+                if u <= last_update_id:
+                    continue                        # old diff
 
-        # initial bridge
-        if not synced:
-            if U <= last_update_id + 1 <= u:
+                if not synced:
+                    if U <= last_update_id + 1 <= u:
+                        apply_diff_to_state(diff)
+                        last_update_id = u
+                        synced = True
+                        log.info("[SYNC] initial bridge at id=%d", u)
+                    continue
+
+                now = time.time()
+                if now - last_refresh >= REFRESH_INTERVAL:
+                    log.info("[REST] periodic refresh")
+                    break                           # resync outer loop
+
+                if U > last_update_id + 1:
+                    log.warning("[GAP] %d → %d – resync", last_update_id, U)
+                    break                           # resync outer loop
+
                 apply_diff_to_state(diff)
                 last_update_id = u
-                synced = True
-                log.info("[SYNC] initial bridge at id=%d", u)
-            continue
 
-        now = time.time()
-        if now - last_refresh >= REFRESH_INTERVAL:
-            log.info("[REST] periodic refresh")
-            last_update_id = fetch_snapshot()
-            synced = False
-            last_refresh = now
-            continue
-
-        if U > last_update_id + 1:
-            log.warning("[GAP] %d → %d – resync", last_update_id, U)
-            last_update_id = fetch_snapshot()
-            synced = False
-            continue
-
-        apply_diff_to_state(diff)
-        last_update_id = u
+        finally:
+            await ws.close()
 
 # ──────────────────────────── MAIN ────────────────────────────────────────
 async def main():
