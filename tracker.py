@@ -2,296 +2,251 @@
 """
 BTC-USDT futures order-book tracker – production version
 
-• REST snapshot → Redis       • WebSocket diffs → Redis
-• Minute snapshots archived   • Band/Δ/ratio printer
-• Best bid/ask queried from Redis
-• Structured logging, back-off, latency stats
+• REST snapshot → Redis  (startup or gap)
+• WebSocket diffs → Redis (continuous @100 ms)
+• Dashboard updates every 1 second, clearing previous output
 """
 
-import asyncio, json, time, sys, random, logging, os
-from typing import Dict, List, Tuple
+import json, time, threading, logging, sys
+import requests, redis, websocket
 
-import requests, websockets, redis
+# ────────────────── Configuration ─────────────────────────────────────────
+SYMBOL       = "BTCUSDT"
+DEPTH_LIMIT  = 5000
+REST_URL     = f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit={DEPTH_LIMIT}"
+# Fastest Binance depth stream is 100 ms
+WS_URL       = f"wss://stream.binance.com:9443/stream?streams={SYMBOL.lower()}@depth@100ms"
 
-# ───────────────────────────── CONFIG ──────────────────────────────────────
-SYMBOL            = "BTCUSDT"
-REST_LIMIT        = 1000
-UPDATE_SPEED      = "100ms"
-REFRESH_INTERVAL  = 60.0                 # seconds between full REST refreshes
-ARCHIVE_TTL       = 24 * 3600            # keep snapshots 24 h in Redis
-TRIM_DEPTH_PCT    = 30.0                 # trim levels >30 % away; 0 = never
+REDIS_HOST   = "redis"
+REDIS_PORT   = 6379
+REDIS_PWD    = "sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A"
 
-REDIS_HOST        = "redis"
-REDIS_PORT        = 6379
-REDIS_PWD         = "sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A"
+DISPLAY_INT  = 0.0001   # refresh dashboard every 1 second
 
-BASE_URL          = "https://fapi.binance.com"
-SNAPSHOT_ENDPOINT = "/fapi/v1/depth"
-WS_URL            = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@depth@{UPDATE_SPEED}"
-
-BIDS_ZSET    = f"orderbook:{SYMBOL}:bids"
-ASKS_ZSET    = f"orderbook:{SYMBOL}:asks"
-QTY_HASH     = f"orderbook:{SYMBOL}:qty"
-DIFFS_LIST   = f"orderbook:{SYMBOL}:diffs"
-
-MAX_UPDATES  = 10_000           # retain last N diffs in Redis list
-
-# ──────────────────────────── LOGGING ──────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("tracker")
-
-# ──────────────────────────── REDIS ────────────────────────────────────────
-r = redis.StrictRedis(
-    host=REDIS_HOST, port=REDIS_PORT,
-    password=REDIS_PWD, decode_responses=True
-)
-try:
-    r.ping()
-except redis.RedisError as e:
-    log.critical("Redis connection failed: %s", e)
-    sys.exit(1)
-
-# ──────────────────────────── BANDS ────────────────────────────────────────
-PRINT_INTERVAL = 3.0  # seconds
-BANDS: List[Tuple[float, float]] = [
-    (0, 1),
-    (1, 2.5),
-    (2.5, 5),
-    (5, 10),
-    (10, 25),
+# Percentage bands for volume metrics
+BANDS = [
+    (0, 1), (1, 2.5), (2.5, 5),
+    (5, 10), (10, 25)
 ]
 
-# ───────────────────────── GLOBAL STATE ────────────────────────────────────
-bids: Dict[float, float] = {}   # price → qty
-asks: Dict[float, float] = {}
-last_update_id: int = 0
+# Only emit screen-clear codes if running in a real terminal
+CLEAR = "" if not sys.stdout.isatty() else "\033[H\033[J"
 
-# ──────────────────────── HELPER FUNCTIONS ────────────────────────────────
-def clear_screen() -> None:
-    print("\033[2J\033[H", end="")
+# ────────────────── Redis keys ────────────────────────────────────────────
+BIDS_SET        = f"{SYMBOL}:orderbook:bids"
+ASKS_SET        = f"{SYMBOL}:orderbook:asks"
+BID_HASH        = f"{SYMBOL}:orderbook:bid_volumes"
+ASK_HASH        = f"{SYMBOL}:orderbook:ask_volumes"
+LAST_UPDATE_KEY = f"{SYMBOL}:last_update_id"
 
-def now_minute() -> int:
-    return int(time.time()) // 60
+# ────────────────── Global state ──────────────────────────────────────────
+r        = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT,
+                             password=REDIS_PWD, decode_responses=True)
+synced   = False
+buffered = []
+lock     = threading.Lock()
+ws_app   = None
 
-def backoff(attempt: int, base: float = 5.0, cap: float = 60.0) -> float:
-    return min(cap, base * 2 ** attempt) * (0.5 + random.random() / 2)
+# ────────────────── Apply a single diff message to Redis ────────────────
+def apply_diff(msg: dict):
+    for price, qty in msg.get("b", []):   # bids
+        q = float(qty)
+        if q == 0:
+            r.zrem(BIDS_SET, price)
+            r.hdel(BID_HASH, price)
+        else:
+            r.zadd(BIDS_SET, {price: float(price)})
+            r.hset(BID_HASH, price, qty)
 
-# ───────────────────────── SNAPSHOT FETCH ─────────────────────────────────
-def fetch_snapshot() -> int:
-    url = BASE_URL + SNAPSHOT_ENDPOINT
-    attempt = 0
-    while True:
-        try:
-            resp = requests.get(
-                url, params={"symbol": SYMBOL, "limit": REST_LIMIT}, timeout=7
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            sid = data["lastUpdateId"]
+    for price, qty in msg.get("a", []):   # asks
+        q = float(qty)
+        if q == 0:
+            r.zrem(ASKS_SET, price)
+            r.hdel(ASK_HASH, price)
+        else:
+            r.zadd(ASKS_SET, {price: float(price)})
+            r.hset(ASK_HASH, price, qty)
 
-            r.delete(BIDS_ZSET, ASKS_ZSET, QTY_HASH)
-            bids.clear(); asks.clear()
+# ────────────────── WebSocket handlers ────────────────────────────────────
+def on_open(ws):
+    print("WebSocket connected")
 
-            pipe = r.pipeline()
-            for p_str, q_str in data["bids"]:
-                qty = float(q_str)
-                if qty:
-                    price = float(p_str)
-                    bids[price] = qty
-                    pipe.zadd(BIDS_ZSET, {p_str: price})
-                    pipe.hset(QTY_HASH, p_str, q_str)
-            for p_str, q_str in data["asks"]:
-                qty = float(q_str)
-                if qty:
-                    price = float(p_str)
-                    asks[price] = qty
-                    pipe.zadd(ASKS_ZSET, {p_str: price})
-                    pipe.hset(QTY_HASH, p_str, q_str)
-            pipe.execute()
+def on_message(ws, raw):
+    msg = json.loads(raw).get("data", {})
+    if not msg:
+        return
+    with lock:
+        if not synced:
+            buffered.append(msg)
+        else:
+            process_live(msg)
 
-            log.info("[REST] snapshot id=%s bids=%d asks=%d",
-                     sid, len(bids), len(asks))
-            return sid
-        except Exception as e:
-            delay = backoff(attempt)
-            log.warning("[REST] error %s – retrying in %.1fs", e, delay)
-            time.sleep(delay)
-            attempt += 1
+def process_live(msg):
+    global synced
+    last_id = int(r.get(LAST_UPDATE_KEY) or 0)
+    U, u    = msg["U"], msg["u"]
 
-# ───────────────────────── APPLY DIFF ─────────────────────────────────────
-def _update_level(book: Dict[float, float], zset: str,
-                  price: float, qty: float, price_str: str, qty_str: str):
-    if qty == 0:
-        book.pop(price, None)
-        r.zrem(zset, price_str)
-        r.hdel(QTY_HASH, price_str)
-    else:
-        book[price] = qty
-        r.zadd(zset, {price_str: price})
-        r.hset(QTY_HASH, price_str, qty_str)
+    if u <= last_id:
+        return
+    if U != last_id + 1:   # gap detected
+        logging.warning(f"Gap {last_id+1}→{U}, resyncing via REST")
+        synced = False
+        ws_app.close()
+        return
 
-def apply_diff_to_state(diff: dict):
-    u = diff["u"]
+    apply_diff(msg)
+    r.set(LAST_UPDATE_KEY, u)
 
-    r.rpush(DIFFS_LIST, json.dumps(diff))
-    r.ltrim(DIFFS_LIST, -MAX_UPDATES, -1)
+def on_error(ws, err):
+    logging.error(f"WS error: {err}")
 
-    t0 = time.perf_counter()
-    for p_str, q_str in diff.get("b", []):
-        price, qty = float(p_str), float(q_str)
-        _update_level(bids, BIDS_ZSET, price, qty, p_str, q_str)
-    for p_str, q_str in diff.get("a", []):
-        price, qty = float(p_str), float(q_str)
-        _update_level(asks, ASKS_ZSET, price, qty, p_str, q_str)
-    latency = (time.perf_counter() - t0) * 1000
-    log.debug("[DIFF] applied id=%d levels=%d latency=%.2f ms",
-              u, len(diff.get("b", [])) + len(diff.get("a", [])), latency)
+def on_close(ws, code, reason):
+    pass
 
-# ───────────────────────── REDIS HELPERS ──────────────────────────────────
-def best_bid_ask() -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    bid_p, _ = r.zrevrange(BIDS_ZSET, 0, 0, withscores=True)[0]
-    ask_p, _ = r.zrange(ASKS_ZSET, 0, 0, withscores=True)[0]
-    bid_q = float(r.hget(QTY_HASH, bid_p) or 0)
-    ask_q = float(r.hget(QTY_HASH, ask_p) or 0)
-    return (float(bid_p), bid_q), (float(ask_p), ask_q)
+def start_ws():
+    global ws_app
+    ws_app = websocket.WebSocketApp(
+        WS_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    threading.Thread(target=ws_app.run_forever, daemon=True).start()
 
-# ───────────────────────── BAND METRICS ───────────────────────────────────
-def band_metrics() -> List[Tuple[str, float, float, float, float]]:
-    if not bids or not asks:
-        return []
-    (best_bid, _), (best_ask, _) = best_bid_ask()
+# ────────────────── REST snapshot & resume logic ─────────────────────────
+def rest_snapshot():
+    snap = requests.get(REST_URL, timeout=5).json()
+    bids, asks = snap["bids"], snap["asks"]
+    last_id = snap["lastUpdateId"]
+
+    pipe = r.pipeline()
+    pipe.delete(BIDS_SET, ASKS_SET, BID_HASH, ASK_HASH, LAST_UPDATE_KEY)
+    for p, q in bids:
+        if float(q) > 0:
+            pipe.zadd(BIDS_SET, {p: float(p)})
+            pipe.hset(BID_HASH, p, q)
+    for p, q in asks:
+        if float(q) > 0:
+            pipe.zadd(ASKS_SET, {p: float(p)})
+            pipe.hset(ASK_HASH, p, q)
+    pipe.set(LAST_UPDATE_KEY, last_id)
+    pipe.execute()
+    print("REST snapshot stored")
+
+def resume_from_redis():
+    last_id = r.get(LAST_UPDATE_KEY)
+    if not last_id:
+        return False
+    last_id = int(last_id)
+    first = None
+    for msg in buffered:
+        if msg["u"] > last_id:
+            if first is None:
+                first = msg
+            if first["U"] != last_id + 1:
+                return False
+            apply_diff(msg)
+            last_id = msg["u"]
+    if first:
+        r.set(LAST_UPDATE_KEY, last_id)
+    return True
+
+def initial_sync():
+    global synced, buffered
+    buffered = []
+    start_ws()
+    time.sleep(1)  # gather early diffs
+
+    if resume_from_redis():
+        print("Resumed from existing Redis snapshot")
+        synced = True
+        buffered.clear()
+        return
+
+    rest_snapshot()
+    last_id = int(r.get(LAST_UPDATE_KEY))
+    for msg in buffered:
+        if msg["u"] > last_id:
+            apply_diff(msg)
+            last_id = msg["u"]
+    r.set(LAST_UPDATE_KEY, last_id)
+    synced = True
+    buffered.clear()
+
+# ────────────────── Dashboard rendering ──────────────────────────────────
+def band_metrics(best_bid, best_ask):
     rows = []
     for lo, hi in BANDS:
-        bid_low  = best_bid * (1 - hi / 100)
-        bid_high = best_bid * (1 - lo / 100)
-        ask_low  = best_ask * (1 + lo / 100)
-        ask_high = best_ask * (1 + hi / 100)
+        bid_low  = best_bid * (1 - hi/100)
+        bid_high = best_bid * (1 - lo/100)
+        ask_low  = best_ask * (1 + lo/100)
+        ask_high = best_ask * (1 + hi/100)
 
-        bid_vol = sum(q for p, q in bids.items() if bid_low <= p < bid_high)
-        ask_vol = sum(q for p, q in asks.items() if ask_low <= p < ask_high)
+        bids_px = r.zrangebyscore(BIDS_SET, bid_low, bid_high)
+        asks_px = r.zrangebyscore(ASKS_SET, ask_low, ask_high)
 
-        delta = bid_vol - ask_vol
-        total = bid_vol + ask_vol
-        ratio = (delta / total * 100) if total else 0.0
-        rows.append((f"{lo:g}-{hi:g}%", bid_vol, ask_vol, delta, ratio))
+        bid_vol = sum(float(r.hget(BID_HASH, p) or 0) for p in bids_px)
+        ask_vol = sum(float(r.hget(ASK_HASH, p) or 0) for p in asks_px)
+        delta   = bid_vol - ask_vol
+        total   = bid_vol + ask_vol
+        ratio   = (delta / total * 100) if total else 0
+
+        rows.append((f"{lo}-{hi}%", bid_vol, ask_vol, delta, ratio))
     return rows
 
-async def printer():
-    while True:
-        clear_screen()
-        (bb_p, bb_q), (ba_p, ba_q) = best_bid_ask()
-        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {SYMBOL}")
-        print(f" Best Bid {bb_p:,.1f}  Qty {bb_q:,.3f}")
-        print(f" Best Ask {ba_p:,.1f}  Qty {ba_q:,.3f}")
-        print("-" * 60)
-        print(f"{'Band':<9} {'BidVol':>10} {'AskVol':>10} {'Δ':>10} {'Ratio%':>8}")
-        for lbl, b, a, d, r_ in band_metrics():
-            print(f"{lbl:<9} {b:10.3f} {a:10.3f} {d:10.3f} {r_:8.2f}")
-        await asyncio.sleep(PRINT_INTERVAL)
-
-# ─────────────────────── SNAPSHOT ARCHIVER ────────────────────────────────
-async def snapshot_archiver():
-    while True:
-        nxt = (now_minute() + 1) * 60
-        await asyncio.sleep(max(0, nxt - time.time()))
-        key = f"snapshot:{SYMBOL}:{now_minute()}"
-        payload = {
-            "id": last_update_id,
-            "bids": bids,
-            "asks": asks,
-        }
-        r.setex(key, ARCHIVE_TTL, json.dumps(payload, separators=(",", ":")))
-        log.info("[ARCHIVE] stored %s (levels=%d+%d)",
-                 key, len(bids), len(asks))
-
-        if TRIM_DEPTH_PCT:
-            (best_bid, _), (best_ask, _) = best_bid_ask()
-            bid_floor = best_bid * (1 - TRIM_DEPTH_PCT / 100)
-            ask_ceiling = best_ask * (1 + TRIM_DEPTH_PCT / 100)
-            r.zremrangebyscore(BIDS_ZSET, "-inf", bid_floor)
-            r.zremrangebyscore(ASKS_ZSET, ask_ceiling, "+inf")
-
-# ───────────────────────── WEBSOCKET HANDLER ──────────────────────────────
-async def open_ws():
-    attempt = 0
-    while True:
-        try:
-            ws = await websockets.connect(
-                WS_URL,
-                ping_interval=20, ping_timeout=20,
-                max_queue=None,
-                compression=None
-            )
-            log.info("[WS] connected")
-            return ws
-        except Exception as e:
-            delay = backoff(attempt)
-            log.warning("[WS] %s – reconnect in %.1fs", e, delay)
-            await asyncio.sleep(delay)
-            attempt += 1
-
-async def ws_handler():
-    global last_update_id
-
-    while True:                                     # outer resync loop
-        last_update_id = fetch_snapshot()
-        ws = await open_ws()
-        synced = False
-        last_refresh = time.time()
-
-        try:
-            while True:                             # recv loop
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                except (asyncio.TimeoutError,
-                        websockets.exceptions.ConnectionClosed):
-                    log.warning("[WS] timed-out/closed – reconnecting")
-                    break                           # resync outer loop
-
-                diff = json.loads(msg)
-                U, u = diff["U"], diff["u"]
-                log.debug("[WS] recv U=%d u=%d", U, u)
-
-                if u <= last_update_id:
-                    continue                        # old diff
-
-                if not synced:
-                    if U <= last_update_id + 1 <= u:
-                        apply_diff_to_state(diff)
-                        last_update_id = u
-                        synced = True
-                        log.info("[SYNC] initial bridge at id=%d", u)
-                    continue
-
-                now = time.time()
-                if now - last_refresh >= REFRESH_INTERVAL:
-                    log.info("[REST] periodic refresh")
-                    break                           # resync outer loop
-
-                if U > last_update_id + 1:
-                    log.warning("[GAP] %d → %d – resync", last_update_id, U)
-                    break                           # resync outer loop
-
-                apply_diff_to_state(diff)
-                last_update_id = u
-
-        finally:
-            await ws.close()
-
-# ──────────────────────────── MAIN ────────────────────────────────────────
-async def main():
-    await asyncio.gather(
-        ws_handler(),
-        snapshot_archiver(),
-        printer(),
-    )
-
-if __name__ == "__main__":
+def show_dashboard():
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Exited.")
+        # get the exact string members for best bid/ask
+        best_bid_str = r.zrange(BIDS_SET, -1, -1)[0]
+        best_ask_str = r.zrange(ASKS_SET,  0,  0)[0]
+
+        # convert to float for numeric operations
+        best_bid = float(best_bid_str)
+        best_ask = float(best_ask_str)
+
+        # look up the exact quantities stored under those fields
+        bid_q = float(r.hget(BID_HASH, best_bid_str) or 0)
+        ask_q = float(r.hget(ASK_HASH, best_ask_str) or 0)
+    except Exception:
+        print("Waiting for data…")
+        return
+
+    # clear the screen if in a real terminal
+    print(CLEAR, end="")
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {SYMBOL}")
+    print(f"Best Bid: {best_bid:,.2f}")
+    print(f"Best Ask: {best_ask:,.2f}")
+    print("-" * 60)
+    print(f"{'Band':<8}{'BidVol':>10}{'AskVol':>10}{'Δ':>10}{'Ratio%':>10}")
+    for band, bvol, avol, dlt, rat in band_metrics(best_bid, best_ask):
+        print(f"{band:<8}{bvol:>10.3f}{avol:>10.3f}{dlt:>10.3f}{rat:>10.2f}")
+
+# ────────────────── Main loop ─────────────────────────────────────────────
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING,
+                        format="%(asctime)s - %(levelname)s - %(message)s")
+    try:
+        r.ping()
+        print("Redis connected")
+    except redis.RedisError as e:
+        print(f"Cannot connect to Redis: {e}")
+        sys.exit(1)
+
+    while True:
+        try:
+            if not synced:
+                initial_sync()
+
+            show_dashboard()
+            time.sleep(DISPLAY_INT)
+
+            # auto-resync on WS disconnect
+            if not getattr(ws_app, "sock", None) or not ws_app.sock.connected:
+                logging.warning("WebSocket disconnected – resyncing")
+                synced = False
+
+        except Exception as ex:
+            logging.error(f"Main loop error: {ex}")
+            synced = False
+            time.sleep(1)
