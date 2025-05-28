@@ -1,19 +1,26 @@
-version: "3"
 
 services:
   redis:
-    image: redis:7.2-alpine
-    command: ["redis-server","--requirepass","sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A"]
+    image: redis:7.2.8
+    container_name: railway-redis-1
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A
     volumes:
-      - redis-data:/data
-    restart: unless-stopped
+      - redis_data:/data
 
   tracker:
     build: .
-    restart: unless-stopped         # auto-start on VM reboot
+    container_name: railway-tracker-1
     depends_on:
-      - redis                       # wait for Redis to be healthy
-    # No environment: section → no `.env` file needed
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PWD=sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A
+    volumes:
+      - .:/app
+    command: python tracker.py
 
 volumes:
-  redis-data:
+  redis_data:
