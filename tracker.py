@@ -1,252 +1,192 @@
 #!/usr/bin/env python3
 """
-BTC-USDT futures order-book tracker – production version
-
-• REST snapshot → Redis  (startup or gap)
-• WebSocket diffs → Redis (continuous @100 ms)
-• Dashboard updates every 1 second, clearing previous output
+BTC-USDT futures order-book tracker  –  Bigtable edition
+────────────────────────────────────────────────────────────────────────────
+• One REST snapshot → Cloud Bigtable   (startup or gap)
+• Continuous @100 ms WebSocket diffs → Cloud Bigtable
+• Dashboard refresh every 1 s (reads best bid / ask *from Bigtable*)
+────────────────────────────────────────────────────────────────────────────
+Prerequisites you create once (manual / Terraform):
+  ▸ Bigtable instance  :  orderbook-inst   (single-region, ≥1 node)
+  ▸ Table              :  btc_orderbook   with column-family  ob
+     - row key “b#<price>” for bids
+     - row key “a#<price>” for asks
+  ▸ Service account running this code has   roles/bigtable.user
+Dependencies:
+  pip install google-cloud-bigtable websocket-client requests
 """
 
-import json, time, threading, logging, sys
-import requests, redis, websocket
+import json, time, threading, logging, sys, requests, websocket
+from google.cloud import bigtable
+from google.cloud.bigtable import row_filters, row
 
-# ────────────────── Configuration ─────────────────────────────────────────
-SYMBOL       = "BTCUSDT"
-DEPTH_LIMIT  = 5000
-REST_URL     = f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit={DEPTH_LIMIT}"
-# Fastest Binance depth stream is 100 ms
-WS_URL       = f"wss://stream.binance.com:9443/stream?streams={SYMBOL.lower()}@depth@100ms"
+# ──────────────── Static configuration ───────────────────────────────────
+PROJECT_ID      = "my-gcp-project"     # <─── change to yours
+INSTANCE_ID     = "orderbook-inst"     # Bigtable instance
+TABLE_ID        = "btc_orderbook"
+COLUMN_FAMILY   = "ob"
+SYMBOL          = "BTCUSDT"
 
-REDIS_HOST   = "redis"
-REDIS_PORT   = 6379
-REDIS_PWD    = "sgP7uvhkNQvn9bV57hRQiHQSkU2MU46A"
+DEPTH_LIMIT     = 5000
+REST_URL        = f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit={DEPTH_LIMIT}"
+WS_URL          = f"wss://stream.binance.com:9443/stream?streams={SYMBOL.lower()}@depth@100ms"
 
-DISPLAY_INT  = 0.0001   # refresh dashboard every 1 second
+DISPLAY_INT     = 1.0                  # dashboard refresh (s)
 
-# Percentage bands for volume metrics
-BANDS = [
-    (0, 1), (1, 2.5), (2.5, 5),
-    (5, 10), (10, 25)
-]
+# ──────────────── Bigtable client / table objects ───────────────────────
+bt_client   = bigtable.Client(project=PROJECT_ID, admin=False)
+bt_instance = bt_client.instance(INSTANCE_ID)
+table       = bt_instance.table(TABLE_ID)
 
-# Only emit screen-clear codes if running in a real terminal
-CLEAR = "" if not sys.stdout.isatty() else "\033[H\033[J"
+# ──────────────── Runtime state ──────────────────────────────────────────
+last_id   = 0
+ws_app    = None
+lock      = threading.Lock()
 
-# ────────────────── Redis keys ────────────────────────────────────────────
-BIDS_SET        = f"{SYMBOL}:orderbook:bids"
-ASKS_SET        = f"{SYMBOL}:orderbook:asks"
-BID_HASH        = f"{SYMBOL}:orderbook:bid_volumes"
-ASK_HASH        = f"{SYMBOL}:orderbook:ask_volumes"
-LAST_UPDATE_KEY = f"{SYMBOL}:last_update_id"
+# ──────────────── Bigtable helpers ───────────────────────────────────────
+def _row_key(side: str, price: str) -> bytes:
+    """Return row-key b#<price> or a#<price>"""
+    return f"{side}#{price}".encode()
 
-# ────────────────── Global state ──────────────────────────────────────────
-r        = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT,
-                             password=REDIS_PWD, decode_responses=True)
-synced   = False
-buffered = []
-lock     = threading.Lock()
-ws_app   = None
-
-# ────────────────── Apply a single diff message to Redis ────────────────
-def apply_diff(msg: dict):
-    for price, qty in msg.get("b", []):   # bids
-        q = float(qty)
-        if q == 0:
-            r.zrem(BIDS_SET, price)
-            r.hdel(BID_HASH, price)
+def batch_mutate(side_prefix: str, price_qty_pairs):
+    """Batch put/delete rows for one side."""
+    rows = []
+    for price, qty in price_qty_pairs:
+        key = _row_key(side_prefix, price)
+        if float(qty) == 0.0:
+            r = row.DirectRow(row_key=key, table=table)
+            r.delete()                             # delete row
         else:
-            r.zadd(BIDS_SET, {price: float(price)})
-            r.hset(BID_HASH, price, qty)
+            r = row.DirectRow(row_key=key, table=table)
+            r.set_cell(COLUMN_FAMILY, b"q", qty.encode())
+        rows.append(r)
+    if rows:
+        table.mutate_rows(rows)
 
-    for price, qty in msg.get("a", []):   # asks
-        q = float(qty)
-        if q == 0:
-            r.zrem(ASKS_SET, price)
-            r.hdel(ASK_HASH, price)
-        else:
-            r.zadd(ASKS_SET, {price: float(price)})
-            r.hset(ASK_HASH, price, qty)
+# ──────────────── Snapshot (initial or gap) ──────────────────────────────
+def store_snapshot():
+    global last_id
+    snap = requests.get(REST_URL, timeout=5).json()
+    last_id = snap["lastUpdateId"]
 
-# ────────────────── WebSocket handlers ────────────────────────────────────
+    # build two DirectRow lists, then bulk-mutate once
+    bids = snap["bids"]
+    asks = snap["asks"]
+    batch_mutate("b", bids)
+    batch_mutate("a", asks)
+    logging.info(f"REST snapshot stored  #{last_id:,}")
+
+# ──────────────── Apply one WebSocket diff to Bigtable ───────────────────
+def apply_diff(msg):
+    batch_mutate("b", msg.get("b", []))
+    batch_mutate("a", msg.get("a", []))
+
+# ──────────────── WebSocket callbacks ────────────────────────────────────
 def on_open(ws):
-    print("WebSocket connected")
+    logging.info("WebSocket connected")
 
 def on_message(ws, raw):
+    global last_id
     msg = json.loads(raw).get("data", {})
     if not msg:
         return
+    U, u = msg["U"], msg["u"]
+
     with lock:
-        if not synced:
-            buffered.append(msg)
-        else:
-            process_live(msg)
-
-def process_live(msg):
-    global synced
-    last_id = int(r.get(LAST_UPDATE_KEY) or 0)
-    U, u    = msg["U"], msg["u"]
-
-    if u <= last_id:
-        return
-    if U != last_id + 1:   # gap detected
-        logging.warning(f"Gap {last_id+1}→{U}, resyncing via REST")
-        synced = False
-        ws_app.close()
-        return
-
-    apply_diff(msg)
-    r.set(LAST_UPDATE_KEY, u)
+        if u <= last_id:                        # already seen
+            return
+        if U != last_id + 1:                    # gap detected
+            logging.warning(f"Gap {last_id+1}→{U} (resync)")
+            ws.close()
+            store_snapshot()
+            return
+        apply_diff(msg)
+        last_id = u
 
 def on_error(ws, err):
     logging.error(f"WS error: {err}")
 
 def on_close(ws, code, reason):
-    pass
+    logging.warning(f"WebSocket closed {code} {reason}")
 
 def start_ws():
     global ws_app
     ws_app = websocket.WebSocketApp(
-        WS_URL,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
+        WS_URL, on_open=on_open, on_message=on_message,
+        on_error=on_error, on_close=on_close
     )
     threading.Thread(target=ws_app.run_forever, daemon=True).start()
 
-# ────────────────── REST snapshot & resume logic ─────────────────────────
-def rest_snapshot():
-    snap = requests.get(REST_URL, timeout=5).json()
-    bids, asks = snap["bids"], snap["asks"]
-    last_id = snap["lastUpdateId"]
+# ──────────────── Dashboard helpers ──────────────────────────────────────
+BANDS = [(0,1), (1,2.5), (2.5,5), (5,10), (10,25)]
+CLEAR = "" if not sys.stdout.isatty() else "\033[H\033[J"
 
-    pipe = r.pipeline()
-    pipe.delete(BIDS_SET, ASKS_SET, BID_HASH, ASK_HASH, LAST_UPDATE_KEY)
-    for p, q in bids:
-        if float(q) > 0:
-            pipe.zadd(BIDS_SET, {p: float(p)})
-            pipe.hset(BID_HASH, p, q)
-    for p, q in asks:
-        if float(q) > 0:
-            pipe.zadd(ASKS_SET, {p: float(p)})
-            pipe.hset(ASK_HASH, p, q)
-    pipe.set(LAST_UPDATE_KEY, last_id)
-    pipe.execute()
-    print("REST snapshot stored")
+def fetch_side(side_prefix: bytes):
+    flt = row_filters.RowKeyRegexFilter(side_prefix + b"#.*")
+    rows = table.read_rows(filter_=flt)
+    for row_data in rows:
+        price = float(row_data.row_key.split(b"#")[1])
+        qty   = float(row_data.cells[COLUMN_FAMILY][b"q"][-1].value)
+        yield price, qty
 
-def resume_from_redis():
-    last_id = r.get(LAST_UPDATE_KEY)
-    if not last_id:
-        return False
-    last_id = int(last_id)
-    first = None
-    for msg in buffered:
-        if msg["u"] > last_id:
-            if first is None:
-                first = msg
-            if first["U"] != last_id + 1:
-                return False
-            apply_diff(msg)
-            last_id = msg["u"]
-    if first:
-        r.set(LAST_UPDATE_KEY, last_id)
-    return True
+def best_prices_and_vols():
+    bids = list(fetch_side(b"b"))
+    asks = list(fetch_side(b"a"))
+    if not bids or not asks:
+        return None
+    best_bid = max(p for p, _ in bids)
+    best_ask = min(p for p, _ in asks)
 
-def initial_sync():
-    global synced, buffered
-    buffered = []
-    start_ws()
-    time.sleep(1)  # gather early diffs
-
-    if resume_from_redis():
-        print("Resumed from existing Redis snapshot")
-        synced = True
-        buffered.clear()
-        return
-
-    rest_snapshot()
-    last_id = int(r.get(LAST_UPDATE_KEY))
-    for msg in buffered:
-        if msg["u"] > last_id:
-            apply_diff(msg)
-            last_id = msg["u"]
-    r.set(LAST_UPDATE_KEY, last_id)
-    synced = True
-    buffered.clear()
-
-# ────────────────── Dashboard rendering ──────────────────────────────────
-def band_metrics(best_bid, best_ask):
+    # compute band volumes
     rows = []
     for lo, hi in BANDS:
-        bid_low  = best_bid * (1 - hi/100)
-        bid_high = best_bid * (1 - lo/100)
-        ask_low  = best_ask * (1 + lo/100)
-        ask_high = best_ask * (1 + hi/100)
-
-        bids_px = r.zrangebyscore(BIDS_SET, bid_low, bid_high)
-        asks_px = r.zrangebyscore(ASKS_SET, ask_low, ask_high)
-
-        bid_vol = sum(float(r.hget(BID_HASH, p) or 0) for p in bids_px)
-        ask_vol = sum(float(r.hget(ASK_HASH, p) or 0) for p in asks_px)
+        bid_vol = sum(q for p, q in bids if best_bid*(1-hi/100) <= p <= best_bid*(1-lo/100))
+        ask_vol = sum(q for p, q in asks if best_ask*(1+lo/100) <= p <= best_ask*(1+hi/100))
         delta   = bid_vol - ask_vol
         total   = bid_vol + ask_vol
-        ratio   = (delta / total * 100) if total else 0
-
+        ratio   = (delta/total*100) if total else 0
         rows.append((f"{lo}-{hi}%", bid_vol, ask_vol, delta, ratio))
-    return rows
+    return best_bid, best_ask, rows
 
 def show_dashboard():
-    try:
-        # get the exact string members for best bid/ask
-        best_bid_str = r.zrange(BIDS_SET, -1, -1)[0]
-        best_ask_str = r.zrange(ASKS_SET,  0,  0)[0]
+    res = best_prices_and_vols()
+    if not res:
+        print("Waiting for data…"); return
+    best_bid, best_ask, rows = res
 
-        # convert to float for numeric operations
-        best_bid = float(best_bid_str)
-        best_ask = float(best_ask_str)
-
-        # look up the exact quantities stored under those fields
-        bid_q = float(r.hget(BID_HASH, best_bid_str) or 0)
-        ask_q = float(r.hget(ASK_HASH, best_ask_str) or 0)
-    except Exception:
-        print("Waiting for data…")
-        return
-
-    # clear the screen if in a real terminal
     print(CLEAR, end="")
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {SYMBOL}")
     print(f"Best Bid: {best_bid:,.2f}")
     print(f"Best Ask: {best_ask:,.2f}")
-    print("-" * 60)
+    print("-"*60)
     print(f"{'Band':<8}{'BidVol':>10}{'AskVol':>10}{'Δ':>10}{'Ratio%':>10}")
-    for band, bvol, avol, dlt, rat in band_metrics(best_bid, best_ask):
+    for band, bvol, avol, dlt, rat in rows:
         print(f"{band:<8}{bvol:>10.3f}{avol:>10.3f}{dlt:>10.3f}{rat:>10.2f}")
 
-# ────────────────── Main loop ─────────────────────────────────────────────
+# ──────────────── Main loop ──────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.WARNING,
-                        format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s — %(levelname)s — %(message)s")
+
     try:
-        r.ping()
-        print("Redis connected")
-    except redis.RedisError as e:
-        print(f"Cannot connect to Redis: {e}")
+        table.sample_row_keys()       # simple health check
+        logging.info("Bigtable connected")
+    except Exception as e:
+        logging.error(f"Cannot connect to Bigtable: {e}")
         sys.exit(1)
+
+    store_snapshot()
+    start_ws()
 
     while True:
         try:
-            if not synced:
-                initial_sync()
+            live = getattr(ws_app, "sock", None) and ws_app.sock.connected
+            if not live:
+                logging.warning("WS down – restarting")
+                start_ws()
 
             show_dashboard()
             time.sleep(DISPLAY_INT)
-
-            # auto-resync on WS disconnect
-            if not getattr(ws_app, "sock", None) or not ws_app.sock.connected:
-                logging.warning("WebSocket disconnected – resyncing")
-                synced = False
-
         except Exception as ex:
             logging.error(f"Main loop error: {ex}")
-            synced = False
             time.sleep(1)
